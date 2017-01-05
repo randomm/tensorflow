@@ -20,6 +20,7 @@ limitations under the License.
 #include <vector>
 
 #include "tensorflow/core/common_runtime/constant_folding.h"
+#include "tensorflow/core/common_runtime/debugger_state_interface.h"
 #include "tensorflow/core/common_runtime/device_factory.h"
 #include "tensorflow/core/common_runtime/executor.h"
 #include "tensorflow/core/common_runtime/function.h"
@@ -397,15 +398,19 @@ Status DirectSession::Run(const RunOptions& run_options,
 
   // EXPERIMENTAL: Options that allow the client to insert nodes into partition
   // graphs for debugging.
-  run_state_args.debugger_state.reset(
-      new DebuggerState(run_options.debug_tensor_watch_opts()));
+  if (!run_options.debug_options().debug_tensor_watch_opts().empty()) {
+    run_state_args.debugger_state =
+        DebuggerStateRegistry::CreateState(run_options.debug_options());
+  }
 
   TF_RETURN_IF_ERROR(
       GetOrCreateExecutors(pool, input_tensor_names, output_names, target_nodes,
                            &executors_and_keys, &run_state_args));
 
   // Create a run state and start execution.
-  RunState run_state(input_tensor_names, output_names);
+  Executor::Args args;
+  args.step_id = step_id_counter_.fetch_add(1);
+  RunState run_state(input_tensor_names, output_names, args.step_id, &devices_);
   run_state.rendez = new IntraProcessRendezvous(device_mgr_.get());
   CancellationManager step_cancellation_manager;
 
@@ -423,8 +428,6 @@ Status DirectSession::Run(const RunOptions& run_options,
         run_state.executors_done.Notify();
       });
 
-  Executor::Args args;
-  args.step_id = step_id_counter_.fetch_add(1);
   args.rendezvous = run_state.rendez;
   args.cancellation_manager = &step_cancellation_manager;
   args.runner = [this, pool](Executor::Args::Closure c) {
@@ -432,10 +435,11 @@ Status DirectSession::Run(const RunOptions& run_options,
   };
   args.session_state = &session_state_;
   args.tensor_store = &run_state.tensor_store;
-  args.step_resource_manager = &run_state.step_resource_manager;
+  args.step_container = &run_state.step_container;
   if (LogMemory::IsEnabled()) {
     LogMemory::RecordStep(args.step_id, run_state_args.handle);
   }
+  args.sync_on_finish = true;
 
   const bool do_trace = (run_options.trace_level() > RunOptions::NO_TRACE);
 
@@ -491,7 +495,12 @@ Status DirectSession::Run(const RunOptions& run_options,
                           ? run_options.timeout_in_ms()
                           : operation_timeout_in_ms_);
 
-  cancellation_manager_->DeregisterCallback(cancellation_token);
+  if (!cancellation_manager_->DeregisterCallback(cancellation_token)) {
+    // The step has been cancelled: make sure we don't attempt to receive the
+    // outputs as this would make it block forever.
+    mutex_lock l(run_state.mu_);
+    run_state.status.Update(errors::Cancelled("Run call was cancelled"));
+  }
 
 #if GOOGLE_CUDA
   if (tracer) {
@@ -574,7 +583,10 @@ Status DirectSession::PRunSetup(const std::vector<string>& input_names,
                                           &run_state_args));
 
   // Create the run state and save it for future PRun calls.
-  RunState* run_state = new RunState(input_names, output_names);
+  Executor::Args args;
+  args.step_id = step_id_counter_.fetch_add(1);
+  RunState* run_state =
+      new RunState(input_names, output_names, args.step_id, &devices_);
   run_state->rendez = new IntraProcessRendezvous(device_mgr_.get());
   {
     mutex_lock l(executor_lock_);
@@ -598,8 +610,6 @@ Status DirectSession::PRunSetup(const std::vector<string>& input_names,
         run_state->executors_done.Notify();
       });
 
-  Executor::Args args;
-  args.step_id = step_id_counter_.fetch_add(1);
   args.rendezvous = run_state->rendez;
   args.cancellation_manager = cancellation_manager_;
   args.runner = [this, pool](Executor::Args::Closure c) {
@@ -607,10 +617,11 @@ Status DirectSession::PRunSetup(const std::vector<string>& input_names,
   };
   args.session_state = &session_state_;
   args.tensor_store = &run_state->tensor_store;
-  args.step_resource_manager = &run_state->step_resource_manager;
+  args.step_container = &run_state->step_container;
   if (LogMemory::IsEnabled()) {
     LogMemory::RecordStep(args.step_id, run_state_args.handle);
   }
+  args.sync_on_finish = true;
 
   if (options_.config.graph_options().build_cost_model()) {
     run_state->collector.reset(new StepStatsCollector(nullptr));
@@ -775,7 +786,8 @@ Status DirectSession::RecvOutputs(const std::vector<string>& output_names,
     s = Rendezvous::ParseKey(output_key, &parsed);
     if (s.ok()) {
       // Fetch data from the Rendezvous.
-      s = rendez->Recv(parsed, Rendezvous::Args(), &output_tensor, &is_dead);
+      s = rendez->Recv(parsed, Rendezvous::Args(), &output_tensor, &is_dead,
+                       operation_timeout_in_ms_);
       if (is_dead && s.ok()) {
         s = errors::InvalidArgument("The tensor returned for ", output_name,
                                     " was not valid.");
@@ -973,7 +985,7 @@ Status DirectSession::GetOrCreateExecutors(
 
     // EXPERIMENTAL: tfdbg inserts debug nodes (i.e., probes) to the graph
     if (run_state_args->debugger_state) {
-      TF_RETURN_IF_ERROR(run_state_args->debugger_state->InsertNodes(
+      TF_RETURN_IF_ERROR(run_state_args->debugger_state->DecorateGraphForDebug(
           partition_graph, params.device));
     }
     iter->second.reset(partition_graph);
@@ -1159,7 +1171,16 @@ Status DirectSession::CreateGraphs(
 }
 
 DirectSession::RunState::RunState(const std::vector<string>& input_names,
-                                  const std::vector<string>& output_names) {
+                                  const std::vector<string>& output_names,
+                                  int64 step_id,
+                                  const std::vector<Device*>* devices)
+    : step_container(step_id, [devices](const string& name) {
+        for (auto d : *devices) {
+          if (!d->resource_manager()->Cleanup(name).ok()) {
+            // Do nothing...
+          }
+        }
+      }) {
   // Initially all the feeds and fetches are pending.
   for (auto& name : input_names) {
     pending_inputs.emplace(name);
@@ -1182,20 +1203,33 @@ DirectSession::RunState::~RunState() {
 void DirectSession::WaitForNotification(RunState* run_state,
                                         CancellationManager* cm,
                                         int64 timeout_in_ms) {
-  if (timeout_in_ms > 0) {
-    bool notified = WaitForNotificationWithTimeout(&run_state->executors_done,
-                                                   timeout_in_ms);
-    if (!notified) {
-      {
-        mutex_lock l(run_state->mu_);
-        run_state->status.Update(Status(error::DEADLINE_EXCEEDED,
-                                        "Timed out waiting for notification"));
-      }
-      cm->StartCancel();
+  Status status =
+      WaitForNotification(&run_state->executors_done, timeout_in_ms);
+  if (!status.ok()) {
+    {
+      mutex_lock l(run_state->mu_);
+      run_state->status.Update(status);
     }
-  } else {
+    cm->StartCancel();
+    // We must wait for the executors to complete, because they have borrowed
+    // references to `cm` and other per-step state. After this notification, it
+    // is safe to clean up the step.
     run_state->executors_done.WaitForNotification();
   }
+}
+
+::tensorflow::Status DirectSession::WaitForNotification(
+    Notification* notification, int64 timeout_in_ms) {
+  if (timeout_in_ms > 0) {
+    bool notified = WaitForNotificationWithTimeout(notification, timeout_in_ms);
+    if (!notified) {
+      return Status(error::DEADLINE_EXCEEDED,
+                    "Timed out waiting for notification");
+    }
+  } else {
+    notification->WaitForNotification();
+  }
+  return Status::OK();
 }
 
 }  // namespace tensorflow
